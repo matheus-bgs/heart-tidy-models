@@ -1,0 +1,411 @@
+---
+title: "Previsão de Doenças Cardiovasculares"
+author: "Matheus Borges"
+date: "14/11/2022"
+lang: "pt-br"
+output:
+  html_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+runtime: shiny
+---
+
+<style>
+body {text-align: justify}
+</style>
+
+```{r setup, include = FALSE}
+# 0 - chunk settings
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE,
+                      message = FALSE, fig.align = "center")
+
+# 1 - pacotes e funções
+library(shiny)
+library(ggplot2)
+
+source("function/plots.R")
+source("function/knit_kable.R")
+
+# 3 - Importação do dataset
+df <- read.csv("../Dados/heart.csv", fileEncoding = "latin1")
+```
+
+# Introdução e Objetivo
+No seguinte relatório, é feita uma análise estatística de um banco de dados (que foi gerado por uma junção de cinco bancos distintos) contendo informações sobre doenças cardiovasculares (DCV) e possíveis regressores - isto é, variáveis que explicam a variável resposta de doença cardiovascular -, a fim de obter um modelo de regressão logística capaz de fazer predições sobre a chance de indivíduos apresentarem DCVs. O modelo obtido no final deste relatório é interpretado como uma ferramenta de prevenção para DCVs, isto é, ele não é capaz de definir se um indivíduo de fato tem alguma doença, mas sim se ele tem altas chances de ter alguma doença.
+
+
+# Visualização dos Dados e Busca de NAs
+Primeiro, visualizamos brevemente algumas variáveis contidas nos dados para nos familiarizarmos com os mesmos. Além disso, estamos em busca de valores `NA`, ou então impossíveis com base na realidade.
+
+```{r}
+# Glimpse
+df %>% 
+  dplyr::glimpse()
+
+# Contando NA por coluna
+df %>% 
+  dplyr::summarise_all(~ sum(is.na(.))) %>% 
+  knit_kable(caption = "Contagem de NA por colunas")
+```
+
+
+```{r, echo = FALSE}
+# Explorando variáveis
+plot_chol <- plot_hist(df, x = Cholesterol, fill = as.factor(HeartDisease),
+          binwidth = 30, title = "Histograma de Colesterol",
+          xlab = "Colesterol", ylab = "Frequência")
+
+plot_bp <- plot_hist(df, x = RestingBP, fill = as.factor(HeartDisease),
+          binwidth = 20, title = "Histograma de Pressão Arterial",
+          xlab = "Pressão Arterial em Repouso",
+          y = "Frequência")
+
+plot_oldp <- plot_hist(df, x = Oldpeak, fill = as.factor(HeartDisease),
+          binwidth = 0.5, title = "Histograma de Oldpeak",
+          xlab = "Oldpeak", ylab = "Frequência")
+
+plots1 <- list("Colesterol" = plotly::ggplotly(plot_chol),
+               "Batimentos Cardíacos" = plotly::ggplotly(plot_bp),
+               "Oldpeak" = plotly::ggplotly(plot_oldp))
+
+
+ui <- fluidPage(theme = shinythemes::shinytheme("sandstone"),
+  selectInput("VARIAVEL", "Escolha uma variável", choices = names(plots1)),
+  plotly::plotlyOutput("PLOT")
+)
+
+server <- function(input, output, session){
+  output$PLOT <- plotly::renderPlotly(
+    plots1[input$VARIAVEL][[1]]
+  )
+}
+
+shinyApp(ui, server, options = list(height = 500))
+```
+
+Percebe-se que, apesar de não serem reportados valores faltantes, existem valores que não têm sentido com a realidade: como colesterol ou batimentos cardíacos em repouso iguais a $0$. Também, a variável _Oldpeak_, que indica uma depressão na onda ST em um eletrocardiograma e ela não pode ser negativa. Dessa forma, devemos buscar alguma forma de preencher esses dados faltantes de forma que não altere a distribuição dos mesmos, visando assim manter a integridade das informações.
+
+# Manipulação dos Dados
+Começaremos alterando a classe de algumas variáveis, processo importante para a geração de um modelo de predição para a variável resposta no final. Além disso, faremos a estimação dos valores considerados anteriormente como impossíveis por meio da técnica dos K-Vizinhos mais Próximos (KNN).
+
+Essa tentativa é de muita importância, visto que a simples exclusão dessas observações do banco de dados acarretaria em uma perda de $20\%$ dos dados e, assim, não somente a informação contida nas variáveis com dados faltantes estaria perdida, como também a informação contida em todas as outras variáveis.
+
+```{r, warning=FALSE}
+# Manipulação dos dados
+df_limpo <- df %>%
+  dplyr::mutate(HeartDisease = as.factor(df$HeartDisease),
+                FastingBS = as.factor(df$FastingBS),
+                Cholesterol = ifelse(Cholesterol == 0, NA, Cholesterol),
+                Oldpeak = ifelse(Oldpeak < 0, NA, Oldpeak),
+                ST_Slope = dplyr::case_when(
+                  ST_Slope == "Down" ~ "Declive",
+                  ST_Slope == "Flat" ~ "Plano",
+                  ST_Slope == "Up" ~ "Aclive"),
+                ExerciseAngina = ifelse(ExerciseAngina == "Y", 1, 0),
+                ExerciseAngina = as.factor(ExerciseAngina))
+
+# Dividindo o dataset em treino e teste
+set.seed(1984)
+split <- rsample::initial_split(df_limpo)
+train <- rsample::training(split)
+test <- rsample::testing(split)
+
+# Receita
+receita <- recipes::recipe(HeartDisease ~ ., data = train) %>% 
+  recipes::step_string2factor(Sex, ChestPainType, RestingECG, ST_Slope) %>% 
+  recipes::step_impute_knn(Oldpeak, Cholesterol, RestingBP,
+                           neighbors = round(sqrt(nrow(train)))) #%>% 
+  # recipes::step_scale()
+
+# df alterado
+df_bake <- receita %>% 
+  recipes::prep() %>% 
+  recipes::bake(new_data = df_limpo)
+```
+
+```{r, echo = FALSE}
+# Variáveis numéricas
+box_Age <- plot_box(df_bake, y = Age,
+                    title = "Boxplot de Idade", ylab = "Idade") 
+hist_Age <- plot_hist(df_bake, x = Age, fill = HeartDisease,
+                      binwidth = 5, title = "Distribuição de Idades",
+                      xlab = "Idade")
+
+
+box_Cholesterol <- plot_box(df_bake, y = Cholesterol,
+                            title = "Boxplot de Colesterol", ylab = "Colesterol")
+hist_Cholesterol <- plot_hist(df_bake, x = Cholesterol, fill = HeartDisease,
+                              binwidth = 30, title = "Distribuição de Colesterol",
+                              xlab = "Colesterol")
+
+
+box_RestingBP <- plot_box(df_bake, y = RestingBP,
+                          title = "Boxplot de Batimentos", ylab = "Batimentos Cardíacos")
+hist_RestingBP <- plot_hist(df_bake, x = RestingBP, fill = HeartDisease,
+                            binwidth = 20, title = "Distribuição de Batimentos",
+                            xlab = "Batimentos Cardíacos")
+
+
+box_MaxHR <- plot_box(df_bake, y = MaxHR,
+                      title = "Boxplot de Batimentos Máx.", 
+                      ylab = "Batimentos Cardíacos Máx.")
+hist_MaxHR <- plot_hist(df_bake, x = RestingBP, fill = HeartDisease,
+                        binwidth = 20, title = "Distribuição de Batimentos Máx.",
+                        xlab = "Batimentos Cardíacos Máx.")
+
+
+box_Oldpeak <- plot_box(df_bake, y = Oldpeak,
+                        title = "Boxplot de Oldpeak", 
+                        ylab = "Oldpeak")
+hist_Oldpeak <- plot_hist(df_bake, x = Oldpeak, fill = HeartDisease,
+                          binwidth = 0.5, title = "Distribuição de Oldpeak",
+                          xlab = "Oldpeak")
+
+# Variáveis categóricas
+bar_Sex <- plot_bar(df_bake, x = Sex, fill = HeartDisease,
+                    title = "Sexo e DCV", xlab = NULL)
+
+bar_ChestPainType <- plot_bar(df_bake, x = ChestPainType, fill = HeartDisease,
+                              title = "Tipo de Dor no Peito e DCV", xlab = NULL)
+
+bar_FastingBS <- plot_bar(df_bake, x = FastingBS, fill = HeartDisease,
+                          title = "Glicose e DCV", xlab = NULL)
+
+bar_RestingECG <- plot_bar(df_bake, x = RestingECG, fill = HeartDisease,
+                           title = "ECG em Repouso e DCV", xlab = NULL)
+
+bar_ExerciseAngina <- plot_bar(df_bake, x = ExerciseAngina, fill = HeartDisease,
+                               title = "Angina por Exercício e DCV", xlab = NULL)
+
+bar_ST_Slope <- plot_bar(df_bake, x = ST_Slope, fill = HeartDisease,
+                         title = "Inclinação ST e DCV", xlab = NULL)
+
+# Variáveis
+plots2 <- list("Idade" = plotly::subplot(box_Age, hist_Age),
+               "Sexo" = plotly::ggplotly(bar_Sex),
+               "Dor no Peito" = plotly::ggplotly(bar_ChestPainType),
+               "Batimentos Cardíacos" = plotly::subplot(box_RestingBP, hist_RestingBP),
+               "Colesterol" = plotly::subplot(box_Cholesterol, hist_Cholesterol),
+               "Glicose em Jejum" = plotly::ggplotly(bar_FastingBS),
+               "ECG em Repouso" = plotly::ggplotly(bar_RestingECG),
+               "Batimentos Cardíacos Máx." = plotly::subplot(box_MaxHR, hist_MaxHR),
+               "Angina" = plotly::ggplotly(bar_ExerciseAngina),
+               "Oldpeak" = plotly::subplot(box_Oldpeak, hist_Oldpeak),
+               "Inclinação ST" = plotly::ggplotly(bar_ST_Slope))
+
+ui <- fluidPage(theme = shinythemes::shinytheme("sandstone"),
+  selectInput("VARIAVEL", "Escolha uma variável", choices = names(plots2)),
+  plotly::plotlyOutput("PLOT")
+)
+
+server <- function(input, output, session){
+  output$PLOT <- plotly::renderPlotly(
+    plots2[input$VARIAVEL][[1]]
+  )
+}
+
+shinyApp(ui, server, options = list(height = 500))
+```
+
+Primeiramente, vemos que há uma correlação positiva entre ambas as variáveis idade e _oldpeak_ com a variável resposta, enquanto as demais variáveis numéricas não parecem apresentar algum tipo de relação óbvia, com exceção da variável de batimentos cardíacos máximos, que apresenta uma correlação negativa. Dessa forma, dentre as variáveis numéricas, essas parecem ser as mais importantes para a predição de doenças cardiovasculares. De contrário a uma possível expectativa usual, a variável colesterol não parece ter influência sobre a prevalência de doenças cardiovasculares, algo que pode ser factual ou uma falsa correlação neutra, dado que boa parte dos dados que trabalhei para essa variável são estimados. A solução mais concreta para essa dúvida seria uma reamostragem desses dados com mais informações observadas para essa variável.
+
+Sobre as variáveis em fatores, percebe-se que há algumas correlações interessantes. Aqui, por brevidade, não explicarei cada variável a fundo, visto que todas são da área da saúde e podem ser de difícil entendimento, porém comentarei sobre as mais relevantes. Primeiro, se um indivíduo tem experiências de angina ao se exercitar, ele aparenta ter mais chances de ter alguma doença, assim como se ele tem uma glicose em jejum acima de 120, o resultado da variável dicotômica de glicose. Sobre os resultados do exame de eletrocardiograma, percebe-se que alterações no segmento de onda ST podem indicar algum tipo de doença e, no gráfico referente ao próprio segmento ST, percebe-se que movimentos de aclive apresentam pouca chance, enquanto movimento de declive ou manter-se plano apresenta uma chance muito alta de doenças cardiovasculares em um indivíduo. Essas duas variáveis, por falarem sobre a mesma coisa, possivelmente possuem autocorrelação e, portanto, sem dúvidas uma será omitida na modelagem feita a seguir. Por fim, podemos ver que a variável do tipo de dor no peito em indivíduos apresenta maior correlação com doenças cardiovasculares caso essa dor seja assintomática em relação aos demais tipos.
+
+# Modelo de Regressão Logística
+
+Primeiramente, começaremos dividindo os nossos dados em grupos de treino e teste. A divisão será feita em $75\%$ para o grupo de treino e os $25\%$ restantes para o grupo de teste. Essa técnica é de extrema importância para a validação das métricas de acurácia obtidas pelo modelo de regressão gerado, por meio de predição nos dados de teste que não foram utilizados para o treinamento do mesmo. Isso se deve pelo fato de que é desejada uma alta acurácia nas predições, porém deve-se confirmar que o modelo não sofreu \emph{overfitting}, isto é, que ele não apenas decorou os dados para os quais foi criado, mas sim aprendeu com eles e é capaz de fazer predições para dados além daqueles usados em treino.
+
+Ainda, é realizada a validação cruzada no grupo de treino, em busca do hiperparâmetro mais adequado para a penalização feita pela regressão _Ridge_, escolhida aqui por motivos de ter sido testada como a mais eficiente para esses dados (dentre _Ridge_, _Lasso_, _Elastic Net_ e a ausência de penalização).
+
+```{r}
+# Refazendo a receita
+receita <- recipes::recipe(HeartDisease ~ ., data = train) %>% 
+  recipes::step_string2factor(Sex, ChestPainType, RestingECG, ST_Slope) %>% 
+  recipes::step_impute_knn(Oldpeak, Cholesterol, RestingBP,
+                           neighbors = round(sqrt(nrow(train)))) %>% 
+  recipes::step_dummy(recipes::all_nominal_predictors()) %>% 
+  recipes::step_zv(recipes::all_predictors()) %>%
+  recipes::step_normalize(recipes::all_predictors())
+  
+
+# Definição do modelo
+reg_model <- parsnip::logistic_reg(penalty = tune(),
+                                   mixture = 0) %>%
+  parsnip::set_engine("glmnet")
+
+# Workflow
+workflow <- workflows::workflow() %>% 
+  workflows::add_model(reg_model) %>%  
+  workflows::add_recipe(receita)
+
+# Validação cruzada
+set.seed(1984)
+cross_val <- rsample::vfold_cv(train, v = 5)
+
+# Tunagem de hiperparametros ----------------------------------------------
+set.seed(1984)
+tunagem <- tune::tune_grid(
+  workflow, 
+  cross_val,
+  grid = 100,
+  metrics = yardstick::metric_set(yardstick::accuracy,
+                                  yardstick::precision,
+                                  yardstick::specificity),
+  control = tune::control_grid(verbose = TRUE, allow_par = FALSE)
+)
+
+# tunagem %>% 
+#   tune::show_best(metric = "accuracy")
+# 
+# tunagem %>% 
+#   tune::show_best(metric = "precision")
+# 
+# tunagem %>% 
+#   tune::show_best(metric = "sensitivity")
+
+workflow <- workflow %>% 
+  tune::finalize_workflow(tune::select_best(tunagem, "accuracy"))
+
+reg_model <- workflow %>%
+  parsnip::fit(data = train)
+
+vip::vi(reg_model$fit$fit) %>%
+  dplyr::mutate(abs_importance = abs(Importance),
+                Variable = forcats::fct_reorder(Variable, abs_importance)) %>%
+  ggplot(aes(x = abs_importance, y = Variable, fill = Sign)) +
+  geom_col(color = "black") +
+  scale_fill_manual(values = c("#003366", "#ffa500"))
+```
+
+
+```{r}
+# Random forest model
+rf_model <- parsnip::rand_forest(mode = "classification",
+                                 mtry = tune(),
+                                 trees = tune(),
+                                 min_n = tune()) %>%
+  parsnip::set_engine("ranger", importance = "impurity")
+
+# Workflow
+workflow <- workflows::workflow() %>% 
+  workflows::add_model(rf_model) %>%  
+  workflows::add_recipe(receita)
+
+# Validação cruzada
+set.seed(1984)
+cross_val <- rsample::vfold_cv(train, v = 5)
+
+# Tunagem de hiperparametros ----------------------------------------------
+set.seed(1984)
+tunagem <- tune::tune_grid(
+  workflow, 
+  cross_val,
+  grid = 100,
+  metrics = yardstick::metric_set(yardstick::accuracy,
+                                  yardstick::precision,
+                                  yardstick::specificity),
+  control = tune::control_grid(verbose = TRUE, allow_par = FALSE)
+)
+
+# tunagem %>% 
+#   tune::show_best(metric = "accuracy")
+# 
+# tunagem %>% 
+#   tune::show_best(metric = "precision")
+# 
+# tunagem %>% 
+# tune::show_best(metric = "specificity")
+
+workflow <- workflow %>% 
+  tune::finalize_workflow(tune::select_best(tunagem, "specificity"))
+
+rf_model <- workflow %>%
+  parsnip::fit(data = train)
+
+rf_model %>% 
+  workflows::extract_fit_parsnip() %>% 
+  vip::vi(num_features = 15) %>% 
+  dplyr::mutate(abs_importance = abs(Importance),
+                Variable = forcats::fct_reorder(Variable, abs_importance)) %>% 
+  ggplot(aes(x = abs_importance, y = Variable, fill = abs_importance)) +
+  geom_col(color = "black") +
+  scale_fill_gradient2()
+```
+
+
+```{r, echo = FALSE}
+previsao_reg <- test %>%  
+  dplyr::mutate(HeartDisease_pred = predict(reg_model,
+                                            new_data = test)$.pred_class)
+
+accu_reg <- previsao_reg %>%  
+  yardstick::accuracy(truth = HeartDisease,
+                      estimate = HeartDisease_pred)
+
+prec_reg <- previsao_reg %>% 
+  yardstick::precision(truth = HeartDisease,
+                       estimate = HeartDisease_pred)
+
+spec_reg <- previsao_reg %>% 
+  yardstick::specificity(truth = HeartDisease,
+                         estimate = HeartDisease_pred)
+
+metrics_reg <- tibble::tibble("Medida" = c("Acurácia", "Precisão", "Especificidade"),
+               "Valor" = c(round(accu_reg$.estimate, 4), 
+                           round(prec_reg$.estimate, 4),
+                           round(spec_reg$.estimate, 4))) %>% 
+  knit_kable(caption = "Valores das métricas treinadas para Regressão Logística")
+
+confusion_reg <- previsao_reg %>% 
+  yardstick::conf_mat(truth = HeartDisease,
+                      estimate = HeartDisease_pred)
+
+rownames(confusion_reg$table) <- c("Predição 0", "Predição 1")
+colnames(confusion_reg$table) <- c("Verdadeiro 0", "Verdadeiro 1")
+
+confusion_reg <- confusion_reg$table %>% 
+  knit_kable(caption = "Matriz de Confusão da Regressão Logística")
+
+
+previsao_rf <- test %>%  
+  dplyr::mutate(HeartDisease_pred = predict(rf_model,
+                                            new_data = test)$.pred_class)
+
+accu_rf <- previsao_rf %>%  
+  yardstick::accuracy(truth = HeartDisease,
+                      estimate = HeartDisease_pred)
+
+prec_rf <- previsao_rf %>% 
+  yardstick::precision(truth = HeartDisease,
+                       estimate = HeartDisease_pred)
+
+spec_rf <- previsao_rf %>% 
+  yardstick::specificity(truth = HeartDisease,
+                         estimate = HeartDisease_pred)
+
+metrics_rf <- tibble::tibble("Medida" = c("Acurácia", "Precisão", "Especificidade"),
+               "Valor" = c(round(accu_rf$.estimate, 4), 
+                           round(prec_rf$.estimate, 4),
+                           round(spec_rf$.estimate, 4))) %>% 
+  knit_kable(caption = "Valores das métricas treinadas para Random Forest")
+
+confusion_rf <- previsao_rf %>% 
+  yardstick::conf_mat(truth = HeartDisease,
+                      estimate = HeartDisease_pred)
+
+rownames(confusion_rf$table) <- c("Predição 0", "Predição 1")
+colnames(confusion_rf$table) <- c("Verdadeiro 0", "Verdadeiro 1")
+
+confusion_rf <- confusion_rf$table %>% 
+  knit_kable(caption = "Matriz de Confusão do Random Forest")
+```
+
+```{r}
+metrics_reg
+metrics_rf
+
+confusion_reg
+confusion_rf
+```
+
